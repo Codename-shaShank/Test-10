@@ -1,0 +1,99 @@
+# ⚠️  SECURITY WARNING — pull_request_target ⚠️
+# This trigger runs with WRITE access to the repo using code checked out from
+# the BASE branch (trusted). However, we fetch `Gemfile.lock` from the
+# UNTRUSTED PR head and pass it to gem_diff.rb for parsing.
+#
+# Today gem_diff.rb only reads/parses the lockfile — that is safe.
+# DO NOT add any code that evals, shells out, or dynamically loads content
+# derived from the PR lockfile (or any other PR-supplied file). Doing so
+# would allow a malicious PR author to achieve remote code execution with
+# the workflow's write token.
+#
+# If you need to run untrusted code, switch to the `workflow_run` trigger
+# pattern instead. See: https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+
+name: Gem Upgrade Review
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+    paths:
+      - "Gemfile"
+      - "Gemfile.lock"
+      - "*.gemspec"
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  
+jobs:
+  review-gems:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    env:
+      GEM_REVIEW_PATH: gem_review.md
+
+    steps:
+      - name: Checkout base branch (trusted code)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0  
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version
+          bundler-cache: false
+
+      - name: Fetch PR Gemfile.lock safely
+        run: |
+          git fetch origin pull/${{ github.event.pull_request.number }}/head:pr-branch
+          git show pr-branch:Gemfile.lock > pr_gemfile.lock
+
+
+      - name: Generate dependency review comment
+        run: ruby .github/scripts/gem_diff.rb
+        env:
+          PR_GEMFILE_LOCK_PATH: pr_gemfile.lock
+
+      - name: Verify gem_review.md exists
+        run: |
+          test -f "$GEM_REVIEW_PATH"
+          test -s "$GEM_REVIEW_PATH"
+          echo "=== gem_review.md contents ==="
+          cat "$GEM_REVIEW_PATH"
+          echo "=== end ==="
+
+      - name: Add stable marker to dependency summary
+        run: |
+          marker='<!-- dependabot-gem-review -->'
+          if ! grep -Fqx "$marker" "$GEM_REVIEW_PATH"; then
+            tmp_file="$(mktemp)"
+            {
+              printf '%s\n\n' "$marker"
+              cat "$GEM_REVIEW_PATH"
+            } > "$tmp_file"
+            mv "$tmp_file" "$GEM_REVIEW_PATH"
+          fi
+
+      - name: Find existing dependency summary comment
+        if: github.event.pull_request != null
+        id: find_dependency_summary_comment
+        uses: peter-evans/find-comment@v3
+        with:
+          token: ${{ github.token }}
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- dependabot-gem-review -->'
+
+      - name: Comment on PR with dependency summary
+        if: github.event.pull_request != null
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ github.token }}
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-id: ${{ steps.find_dependency_summary_comment.outputs.comment-id }}
+          body-file: ${{ env.GEM_REVIEW_PATH }}
+          edit-mode: replace
